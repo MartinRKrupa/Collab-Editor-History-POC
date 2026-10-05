@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Collab editor</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <p class="eyebrow">Shared plain text</p>
+        <h1>Collab editor</h1>
+        <p id="status" class="status" role="status">Connecting…</p>
+      </div>
+      <form id="document-form" class="field-group">
+        <label for="document-name">Document</label>
+        <div class="field-row">
+          <input
+            id="document-name"
+            name="document"
+            maxlength="64"
+            spellcheck="false"
+            autocomplete="off"
+            required
+          />
+          <button type="submit">Open</button>
+        </div>
+      </form>
+      <div class="field-group">
+        <label for="user-name">Your name</label>
+        <div class="field-row">
+          <input id="user-name" name="user" maxlength="40" autocomplete="off" />
+          <button id="new-name" type="button">New name</button>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section class="editor-panel" aria-label="Document">
+        <div id="history-banner" class="history-banner" hidden>
+          <p id="history-banner-text"></p>
+          <button id="return-live" type="button">Return to live editing</button>
+        </div>
+        <div id="editor" class="editor-host"></div>
+        <div id="history-editor" class="editor-host" hidden></div>
+        <p id="editor-message" class="editor-message">Loading the document…</p>
+      </section>
+      <aside>
+        <section>
+          <h2 id="people-heading">Collaborating now</h2>
+          <ul id="people" class="people"></ul>
+        </section>
+        <section class="history-section">
+          <div class="section-title">
+            <h2>Stored changes</h2>
+            <p id="history-count" class="hint"></p>
+          </div>
+          <p class="hint">
+            View a stored version to make your editor read-only. Everyone else
+            keeps editing the live document.
+          </p>
+          <ol id="history" class="history"></ol>
+        </section>
+      </aside>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
