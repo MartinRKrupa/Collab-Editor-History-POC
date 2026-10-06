@@ -44,16 +44,8 @@ const ANIMALS = [
   "Tern",
 ];
 
-const COLORS = [
-  { color: "#0f5c56", light: "#0f5c5633" },
-  { color: "#9a3412", light: "#9a341233" },
-  { color: "#1d4e89", light: "#1d4e8933" },
-  { color: "#6b3fa0", light: "#6b3fa033" },
-  { color: "#9f1239", light: "#9f123933" },
-  { color: "#3f6212", light: "#3f621233" },
-  { color: "#a16207", light: "#a1620733" },
-  { color: "#0f4c5c", light: "#0f4c5c33" },
-];
+/** Shown until the server assigns this document's shared color. */
+const PENDING_COLOR = { color: "#57534e", colorLight: "#f5f5f4" };
 
 function pick<T>(items: readonly T[]): T {
   const index = Math.floor(Math.random() * items.length);
@@ -61,11 +53,10 @@ function pick<T>(items: readonly T[]): T {
 }
 
 export function generateIdentity(): Identity {
-  const palette = pick(COLORS);
   return {
     name: `${pick(ADJECTIVES)} ${pick(ANIMALS)}`,
-    color: palette.color,
-    colorLight: palette.light,
+    color: PENDING_COLOR.color,
+    colorLight: PENDING_COLOR.colorLight,
   };
 }
 
@@ -79,7 +70,13 @@ export function loadIdentity(): Identity {
 
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (isIdentity(parsed)) return parsed;
+    if (isIdentity(parsed)) {
+      return {
+        ...parsed,
+        color: PENDING_COLOR.color,
+        colorLight: PENDING_COLOR.colorLight,
+      };
+    }
   } catch {
     // Replace a corrupt saved identity with a fresh one.
   }

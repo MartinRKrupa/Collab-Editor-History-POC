@@ -1,17 +1,24 @@
 import { Server, type Connection, type Document } from "@hocuspocus/server";
 import * as Y from "yjs";
+import { attributeAuthors } from "./attribute";
 import {
   appendUpdate,
+  authorColorMap,
+  claimAuthorColor,
   closeDatabase,
   listUpdateBlobs,
+  listVersionsUntil,
   openDatabase,
   readHistory,
   readStoredUpdate,
   recordUpdate,
+  truncateUpdatesAfter,
 } from "./db";
 import { isDocumentName } from "./documentName";
+import { SERVER_COLOR, type AuthorColor } from "./palette";
 
 const PORT = 1234;
+const resettingDocuments = new Set<string>();
 const TEXT_FIELD = "content";
 const WELCOME_TEXT = [
   "This is a shared document.",
@@ -50,7 +57,13 @@ const server = new Server({
     // append another copy of history.
     return loadDocument(documentName);
   },
+  async beforeHandleMessage({ documentName }) {
+    if (resettingDocuments.has(documentName)) {
+      throw new Error("Document is reverting");
+    }
+  },
   async onChange({ documentName, document, update, connection }) {
+    if (resettingDocuments.has(documentName)) return;
     try {
       recordUpdate(
         documentName,
@@ -83,6 +96,72 @@ const server = new Server({
           return;
         }
 
+        const authorMatch = /^\/api\/documents\/([^/]+)\/authors$/.exec(url.pathname);
+        if (request.method === "POST" && authorMatch?.[1]) {
+          const documentName = decodeURIComponent(authorMatch[1]);
+          void readBody(request)
+            .then((raw) => {
+              try {
+                if (!isDocumentName(documentName)) {
+                  sendJson(response, 400, { error: "Invalid document name." });
+                  reject();
+                  return;
+                }
+                const name = authorNameFromBody(raw);
+                if (!name) {
+                  sendJson(response, 400, { error: "Enter a name." });
+                  reject();
+                  return;
+                }
+                const palette = claimAuthorColor(documentName, name);
+                sendJson(response, 200, {
+                  name,
+                  color: palette.color,
+                  colorLight: palette.colorLight,
+                });
+                reject();
+              } catch (error) {
+                console.error("[http] request failed", error);
+                sendJson(response, 500, { error: "Failed to assign a color." });
+                reject();
+              }
+            })
+            .catch((error: unknown) => {
+              console.error("[http] request failed", error);
+              sendJson(response, 400, { error: "Invalid request." });
+              reject();
+            });
+          return;
+        }
+
+        const revertMatch = /^\/api\/documents\/([^/]+)\/updates\/(\d+)\/revert$/.exec(
+          url.pathname,
+        );
+        if (request.method === "POST" && revertMatch?.[1] && revertMatch[2]) {
+          const documentName = decodeURIComponent(revertMatch[1]);
+          const updateId = Number(revertMatch[2]);
+          if (!isDocumentName(documentName) || !Number.isSafeInteger(updateId)) {
+            sendJson(response, 400, { error: "Invalid document name." });
+            reject();
+            return;
+          }
+          void revertDocument(documentName, updateId)
+            .then((result) => {
+              if (!result) {
+                sendJson(response, 404, { error: "Stored change not found." });
+              } else {
+                sendJson(response, 200, { document: documentName, updateId, ...result });
+              }
+              reject();
+            })
+            .catch((error: unknown) => {
+              console.error("[http] request failed", error);
+              sendJson(response, 500, { error: "Failed to revert the document." });
+              reject();
+            });
+          return;
+        }
+
         const updateMatch = /^\/api\/documents\/([^/]+)\/updates\/(\d+)$/.exec(
           url.pathname,
         );
@@ -100,7 +179,17 @@ const server = new Server({
             reject();
             return;
           }
-          sendJson(response, 200, { document: documentName, update });
+          const versions = listVersionsUntil(documentName, updateId);
+          sendJson(response, 200, {
+            document: documentName,
+            update: {
+              ...update,
+              attributions: colorAttributions(
+                documentName,
+                attributeAuthors(versions),
+              ),
+            },
+          });
           reject();
           return;
         }
@@ -117,7 +206,15 @@ const server = new Server({
           }
           const limit = clampLimit(url.searchParams.get("limit"));
           const history = readHistory(documentName, limit);
-          sendJson(response, 200, { document: documentName, ...history });
+          const colors = authorColorMap(documentName);
+          sendJson(response, 200, {
+            document: documentName,
+            total: history.total,
+            updates: history.updates.map((update) => ({
+              ...update,
+              ...colorForAuthorName(colors, update.authorName),
+            })),
+          });
           reject();
           return;
         }
@@ -133,6 +230,41 @@ const server = new Server({
   },
 });
 
+async function revertDocument(
+  documentName: string,
+  updateId: number,
+): Promise<{ removed: number } | null> {
+  resettingDocuments.add(documentName);
+  try {
+    const result = truncateUpdatesAfter(documentName, updateId);
+    if (!result) return null;
+
+    const hocuspocus = server.hocuspocus;
+    const document = hocuspocus.documents.get(documentName);
+    if (!document) return result;
+
+    // Clients must discard their copy. Merging the old document back in
+    // would recreate the changes that were just deleted.
+    document.broadcastStateless(JSON.stringify({ type: "reset" }));
+    hocuspocus.closeConnections(documentName);
+    const debounceId = `onStoreDocument-${documentName}`;
+    if (hocuspocus.debouncer.isDebounced(debounceId)) {
+      await hocuspocus.debouncer.executeNow(debounceId);
+    }
+    if (hocuspocus.documents.get(documentName) === document) {
+      hocuspocus.documents.delete(documentName);
+      try {
+        document.destroy();
+      } catch (error) {
+        console.error(`[sync] failed to drop "${documentName}" after revert`, error);
+      }
+    }
+    return result;
+  } finally {
+    resettingDocuments.delete(documentName);
+  }
+}
+
 function authorName(
   document: Document,
   connection: Connection | undefined,
@@ -142,10 +274,73 @@ function authorName(
     const state = document.awareness.getStates().get(clientId) as
       | { user?: { name?: string } }
       | undefined;
-    const name = state?.user?.name?.trim();
+    const name = state?.user?.name?.trim().slice(0, 40);
     if (name) return name;
   }
   return null;
+}
+
+function colorAttributions(
+  documentName: string,
+  spans: Array<{ start: number; end: number; authorName: string | null }>,
+): Array<{
+  start: number;
+  end: number;
+  authorName: string | null;
+  color: string;
+  colorLight: string;
+}> {
+  const colors = authorColorMap(documentName);
+  return spans.map((span) => ({
+    ...span,
+    ...colorForAuthorName(colors, span.authorName),
+  }));
+}
+
+function colorForAuthorName(
+  colors: Map<string, AuthorColor>,
+  authorName: string | null,
+): AuthorColor {
+  if (!authorName) return SERVER_COLOR;
+  return colors.get(authorName) ?? SERVER_COLOR;
+}
+
+function authorNameFromBody(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const name = (parsed as { name?: unknown }).name;
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim().slice(0, 40);
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function readBody(request: {
+  on(event: "data", listener: (chunk: Buffer | string) => void): void;
+  on(event: "end", listener: () => void): void;
+  on(event: "error", listener: (error: Error) => void): void;
+  destroy(): void;
+}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on("data", (chunk) => {
+      const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      size += buffer.length;
+      if (size > 2048) {
+        reject(new Error("Request body is too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("error", reject);
+  });
 }
 
 function clampLimit(value: string | null): number {

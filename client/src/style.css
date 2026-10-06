@@ -135,6 +135,41 @@ button.ghost[aria-pressed="true"] {
   background: var(--accent-soft);
 }
 
+button.danger {
+  background: var(--danger);
+}
+
+.revert-dialog {
+  border: 0;
+  border-radius: 12px;
+  padding: 20px;
+  max-width: 28rem;
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+
+.revert-dialog::backdrop {
+  background: rgb(31 26 20 / 35%);
+}
+
+.revert-dialog p {
+  margin-top: 8px;
+  line-height: 1.45;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+button.ghost.danger {
+  background: transparent;
+  color: var(--danger);
+}
+
 main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -161,13 +196,32 @@ main {
   border-bottom: 1px solid var(--line);
 }
 
-.history-banner[hidden] {
+.history-banner[hidden],
+.legend[hidden] {
   display: none;
 }
 
 .history-banner p {
   font-size: 0.9rem;
   line-height: 1.4;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 0;
+  padding: 8px 16px;
+  list-style: none;
+  background: #fbf8f3;
+  border-bottom: 1px solid var(--line);
+}
+
+.legend li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.85rem;
 }
 
 .editor-host {

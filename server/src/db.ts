@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import * as Y from "yjs";
+import { colorForIndex, type AuthorColor } from "./palette";
 
 const dataDirectory = path.join(
   fileURLToPath(new URL(".", import.meta.url)),
@@ -61,6 +62,13 @@ export function openDatabase(): DatabaseSync {
 
     CREATE INDEX IF NOT EXISTS updates_document_id_id_idx
       ON updates (document_id, id);
+
+    CREATE TABLE IF NOT EXISTS authors (
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      color_index INTEGER NOT NULL,
+      PRIMARY KEY (document_id, name)
+    );
   `);
   ensureCollapsibleColumn(database);
 
@@ -125,10 +133,12 @@ export function recordUpdate(
 ): number {
   const db = openDatabase();
   const documentId = ensureDocument(name);
+  const author = normalizeAuthorName(authorName);
+  if (author) claimAuthorColor(name, author);
   const streak =
-    authorName === null ? [] : trailingCollapsibleStreak(db, documentId, authorName);
+    author === null ? [] : trailingCollapsibleStreak(db, documentId, author);
   if (streak.length === 0) {
-    return insertUpdate(db, documentId, update, textAfter, authorName, true);
+    return insertUpdate(db, documentId, update, textAfter, author, true);
   }
 
   const anchorId = streak[0]!;
@@ -159,7 +169,7 @@ export function recordUpdate(
   }
 
   console.log(
-    `[db] merged edit into #${anchorId} for "${name}" by ${authorName} (${merged.byteLength} bytes, ${textAfter.length} chars, delta ${charDelta})`,
+    `[db] merged edit into #${anchorId} for "${name}" by ${author} (${merged.byteLength} bytes, ${textAfter.length} chars, delta ${charDelta})`,
   );
   return anchorId;
 }
@@ -356,6 +366,151 @@ export function readStoredUpdate(
     charDelta: asNumber(row.char_delta),
     text: row.text_after,
   };
+}
+
+/**
+ * Delete every stored change after `updateId`. The chosen row stays, and it
+ * becomes the latest version of the document.
+ */
+export function truncateUpdatesAfter(
+  name: string,
+  updateId: number,
+): { removed: number } | null {
+  const db = openDatabase();
+  const target = db
+    .prepare(
+      `SELECT u.id
+       FROM updates u
+       JOIN documents d ON d.id = u.document_id
+       WHERE d.name = ? AND u.id = ?`,
+    )
+    .get(name, updateId) as { id: number | bigint } | undefined;
+  if (!target) return null;
+
+  const document = db
+    .prepare("SELECT id FROM documents WHERE name = ?")
+    .get(name) as { id: number | bigint };
+  const documentId = asNumber(document.id);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = db
+      .prepare("DELETE FROM updates WHERE document_id = ? AND id > ?")
+      .run(documentId, updateId);
+    db.exec("COMMIT");
+    return { removed: asNumber(result.changes) };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export function listVersionsUntil(
+  name: string,
+  updateId: number,
+): Array<{ authorName: string | null; text: string }> {
+  const db = openDatabase();
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.author_name, u.text_after
+       FROM updates u
+       JOIN documents d ON d.id = u.document_id
+       WHERE d.name = ? AND u.id <= ?
+       ORDER BY u.id ASC`,
+    )
+    .all(name, updateId) as Array<{
+    id: number | bigint;
+    author_name: string | null;
+    text_after: string;
+  }>;
+  if (rows.length === 0 || asNumber(rows.at(-1)!.id) !== updateId) return [];
+  return rows.map((row) => ({
+    authorName: row.author_name,
+    text: row.text_after,
+  }));
+}
+
+export function claimAuthorColor(documentName: string, authorName: string): AuthorColor {
+  const name = normalizeAuthorName(authorName);
+  if (!name) return colorForIndex(0);
+  const colors = syncAuthorColors(documentName, name);
+  return colors.get(name) ?? colorForIndex(0);
+}
+
+/** Colors already assigned to people who have written this document. */
+export function authorColorMap(documentName: string): Map<string, AuthorColor> {
+  const db = openDatabase();
+  const documentId = ensureDocument(documentName);
+  const historical = historicalAuthorNames(db, documentId);
+  const assigned = assignedAuthors(db, documentId);
+  if (historical.every((name) => assigned.has(name))) return toColorMap(assigned);
+  return syncAuthorColors(documentName, null);
+}
+
+function syncAuthorColors(
+  documentName: string,
+  extraName: string | null,
+): Map<string, AuthorColor> {
+  const db = openDatabase();
+  const documentId = ensureDocument(documentName);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const assigned = assignedAuthors(db, documentId);
+    let next = 0;
+    for (const index of assigned.values()) {
+      if (index >= next) next = index + 1;
+    }
+    const insert = db.prepare(
+      "INSERT INTO authors (document_id, name, color_index) VALUES (?, ?, ?)",
+    );
+    for (const name of historicalAuthorNames(db, documentId)) {
+      if (assigned.has(name)) continue;
+      insert.run(documentId, name, next);
+      assigned.set(name, next);
+      next += 1;
+    }
+    if (extraName && !assigned.has(extraName)) {
+      insert.run(documentId, extraName, next);
+      assigned.set(extraName, next);
+    }
+    db.exec("COMMIT");
+    return toColorMap(assigned);
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function historicalAuthorNames(db: DatabaseSync, documentId: number): string[] {
+  const rows = db
+    .prepare(
+      `SELECT author_name AS name
+       FROM updates
+       WHERE document_id = ? AND author_name IS NOT NULL
+       GROUP BY author_name
+       ORDER BY MIN(id)`,
+    )
+    .all(documentId) as Array<{ name: string }>;
+  return rows.map((row) => row.name);
+}
+
+function assignedAuthors(db: DatabaseSync, documentId: number): Map<string, number> {
+  const rows = db
+    .prepare("SELECT name, color_index FROM authors WHERE document_id = ?")
+    .all(documentId) as Array<{ name: string; color_index: number | bigint }>;
+  const assigned = new Map<string, number>();
+  for (const row of rows) assigned.set(row.name, asNumber(row.color_index));
+  return assigned;
+}
+
+function toColorMap(assigned: Map<string, number>): Map<string, AuthorColor> {
+  const colors = new Map<string, AuthorColor>();
+  for (const [name, index] of assigned) colors.set(name, colorForIndex(index));
+  return colors;
+}
+
+function normalizeAuthorName(authorName: string | null): string | null {
+  const name = authorName?.trim().slice(0, 40) ?? "";
+  return name.length > 0 ? name : null;
 }
 
 function excerpt(text: string): string {

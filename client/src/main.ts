@@ -1,5 +1,5 @@
-import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorState, RangeSetBuilder } from "@codemirror/state";
+import { Decoration, EditorView } from "@codemirror/view";
 import { HocuspocusProvider, WebSocketStatus } from "@hocuspocus/provider";
 import { basicSetup } from "codemirror";
 import * as Y from "yjs";
@@ -22,6 +22,8 @@ type HistoryUpdate = {
   textLength: number;
   charDelta: number;
   authorName: string | null;
+  color: string;
+  colorLight: string;
   excerpt: string;
 };
 
@@ -29,6 +31,14 @@ type HistoryResponse = {
   document: string;
   total: number;
   updates: HistoryUpdate[];
+};
+
+type AttributionSpan = {
+  start: number;
+  end: number;
+  authorName: string | null;
+  color: string;
+  colorLight: string;
 };
 
 type StoredUpdateResponse = {
@@ -39,6 +49,7 @@ type StoredUpdateResponse = {
     authorName: string | null;
     charDelta: number;
     text: string;
+    attributions: AttributionSpan[];
   };
 };
 
@@ -51,7 +62,10 @@ const editorHost = required<HTMLDivElement>("#editor");
 const historyEditorHost = required<HTMLDivElement>("#history-editor");
 const historyBanner = required<HTMLDivElement>("#history-banner");
 const historyBannerText = required<HTMLParagraphElement>("#history-banner-text");
+const historyLegend = required<HTMLUListElement>("#history-legend");
 const returnLiveButton = required<HTMLButtonElement>("#return-live");
+const revertDialog = required<HTMLDialogElement>("#revert-dialog");
+const revertDialogText = required<HTMLParagraphElement>("#revert-dialog-text");
 const editorMessage = required<HTMLParagraphElement>("#editor-message");
 const documentForm = required<HTMLFormElement>("#document-form");
 const documentInput = required<HTMLInputElement>("#document-name");
@@ -74,6 +88,9 @@ let historyTimer = 0;
 let latestHistory: HistoryResponse | null = null;
 let viewedUpdateId: number | null = null;
 let viewRequest = 0;
+let colorRequest = 0;
+let colorTimer = 0;
+let resettingPage = false;
 
 const provider = new HocuspocusProvider({
   url: SERVER_URL,
@@ -92,10 +109,15 @@ const provider = new HocuspocusProvider({
   onAwarenessUpdate() {
     renderPeople();
   },
+  onStateless({ payload }) {
+    if (!isResetMessage(payload)) return;
+    resetPage();
+  },
 });
 
 publishIdentity();
 renderPeople();
+void claimColor();
 
 nameInput.addEventListener("input", () => {
   const name = nameInput.value.trim();
@@ -103,6 +125,12 @@ nameInput.addEventListener("input", () => {
   identity = { ...identity, name: name.slice(0, 40) };
   saveIdentity(identity);
   publishIdentity();
+  scheduleClaim();
+});
+
+nameInput.addEventListener("blur", () => {
+  if (!identity.name.trim()) return;
+  claimNow();
 });
 
 newNameButton.addEventListener("click", () => {
@@ -110,6 +138,7 @@ newNameButton.addEventListener("click", () => {
   saveIdentity(identity);
   nameInput.value = identity.name;
   publishIdentity();
+  claimNow();
 });
 
 documentForm.addEventListener("submit", (event) => {
@@ -150,12 +179,68 @@ function currentDocumentName(): string {
   return "welcome";
 }
 
+function resetPage(): void {
+  if (resettingPage) return;
+  resettingPage = true;
+  provider.configuration.websocketProvider.disconnect();
+  window.location.reload();
+}
+
+function isResetMessage(payload: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    return (
+      !!parsed &&
+      typeof parsed === "object" &&
+      (parsed as { type?: unknown }).type === "reset"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function publishIdentity(): void {
   provider.setAwarenessField("user", {
     name: identity.name,
     color: identity.color,
     colorLight: identity.colorLight,
   });
+}
+
+function scheduleClaim(): void {
+  window.clearTimeout(colorTimer);
+  colorTimer = window.setTimeout(() => {
+    void claimColor();
+  }, 400);
+}
+
+function claimNow(): void {
+  window.clearTimeout(colorTimer);
+  void claimColor();
+}
+
+async function claimColor(): Promise<void> {
+  const request = ++colorRequest;
+  const name = identity.name;
+  try {
+    const response = await fetch(
+      `/api/documents/${encodeURIComponent(documentName)}/authors`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      },
+    );
+    if (request !== colorRequest || !response.ok) return;
+    const body = (await response.json()) as { color?: string; colorLight?: string };
+    if (request !== colorRequest || identity.name !== name) return;
+    if (!body.color || !body.colorLight) return;
+    identity = { ...identity, color: body.color, colorLight: body.colorLight };
+    saveIdentity(identity);
+    publishIdentity();
+  } catch {
+    // The next edit or rename claims again. Presence stays on the placeholder until then.
+  }
 }
 
 function mountEditor(): void {
@@ -207,7 +292,7 @@ function renderPeople(): void {
       return {
         clientId,
         name: user?.name?.trim() || "Anonymous",
-        color: user?.color || "#6f675d",
+        color: user?.color || "#57534e",
         self: clientId === localId,
       };
     })
@@ -289,7 +374,8 @@ function showSnapshot(update: StoredUpdateResponse["update"]): void {
   historyEditorHost.hidden = false;
   historyBanner.hidden = false;
   const who = update.authorName ?? "the server";
-  historyBannerText.textContent = `Viewing the version stored at ${formatTime(update.createdAt)} by ${who}. Your editor is read-only. Other people can still edit.`;
+  historyBannerText.textContent = `Viewing the version stored at ${formatTime(update.createdAt)} by ${who}. Color shows who wrote each part. Your editor is read-only. Other people can still edit.`;
+  renderLegend(update.attributions);
 
   historyEditor?.destroy();
   historyEditor = new EditorView({
@@ -302,6 +388,7 @@ function showSnapshot(update: StoredUpdateResponse["update"]): void {
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         EditorView.contentAttributes.of({ "aria-readonly": "true" }),
+        authorMarks(update.text, update.attributions),
         EditorView.theme({
           "&": { height: "100%" },
           ".cm-scroller": { overflow: "auto" },
@@ -312,6 +399,48 @@ function showSnapshot(update: StoredUpdateResponse["update"]): void {
   if (latestHistory) renderHistory(latestHistory);
 }
 
+function authorMarks(text: string, spans: AttributionSpan[]) {
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const span of spans) {
+    if (span.start < 0 || span.end <= span.start || span.end > text.length) continue;
+    const label = span.authorName ?? "server";
+    builder.add(
+      span.start,
+      span.end,
+      Decoration.mark({
+        class: "cm-author",
+        attributes: {
+          "data-author": label,
+          title: label,
+          style: `color: ${span.color}; background-color: ${span.colorLight}`,
+        },
+      }),
+    );
+  }
+  return EditorView.decorations.of(builder.finish());
+}
+
+function renderLegend(spans: AttributionSpan[]): void {
+  const seen = new Set<string>();
+  const items: HTMLLIElement[] = [];
+  for (const span of spans) {
+    const label = span.authorName ?? "server";
+    if (seen.has(label)) continue;
+    seen.add(label);
+    const item = document.createElement("li");
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = span.color;
+    swatch.setAttribute("aria-hidden", "true");
+    const name = document.createElement("span");
+    name.textContent = label;
+    item.append(swatch, name);
+    items.push(item);
+  }
+  historyLegend.replaceChildren(...items);
+  historyLegend.hidden = items.length === 0;
+}
+
 function returnToLive(): void {
   viewRequest += 1;
   viewedUpdateId = null;
@@ -320,6 +449,8 @@ function returnToLive(): void {
   historyEditorHost.hidden = true;
   historyEditorHost.replaceChildren();
   historyBanner.hidden = true;
+  historyLegend.hidden = true;
+  historyLegend.replaceChildren();
   editorHost.hidden = false;
   editor?.requestMeasure();
   editor?.focus();
@@ -350,8 +481,11 @@ function renderHistory(body: HistoryResponse): void {
       const actions = document.createElement("div");
       actions.className = "meta-actions";
       const delta = document.createElement("span");
-      const who = update.authorName ?? "server";
-      delta.textContent = `${who} ${formatDelta(update.charDelta)}`;
+      const who = document.createElement("span");
+      who.className = "history-author";
+      who.textContent = update.authorName ?? "server";
+      who.style.color = update.color;
+      delta.textContent = formatDelta(update.charDelta);
       delta.className = update.charDelta < 0 ? "delta-negative" : "delta-positive";
       const viewButton = document.createElement("button");
       viewButton.type = "button";
@@ -361,7 +495,18 @@ function renderHistory(body: HistoryResponse): void {
       viewButton.addEventListener("click", () => {
         void showStoredUpdate(update.id);
       });
-      actions.append(delta, viewButton);
+      actions.append(who, delta, viewButton);
+      const latestId = body.updates[0]?.id;
+      if (update.id !== latestId) {
+        const revertButton = document.createElement("button");
+        revertButton.type = "button";
+        revertButton.className = "ghost danger";
+        revertButton.textContent = "Revert";
+        revertButton.addEventListener("click", () => {
+          void revertTo(update);
+        });
+        actions.append(revertButton);
+      }
       meta.append(time, actions);
 
       const excerpt = document.createElement("p");
@@ -371,6 +516,45 @@ function renderHistory(body: HistoryResponse): void {
       return item;
     }),
   );
+}
+
+function confirmRevert(update: HistoryUpdate): Promise<boolean> {
+  const who = update.authorName ?? "the server";
+  revertDialogText.textContent = `Revert the shared document to the version stored at ${formatTime(update.createdAt)} by ${who}? Every change stored after that version is deleted for everyone.`;
+  revertDialog.showModal();
+  return new Promise((resolve) => {
+    revertDialog.addEventListener(
+      "close",
+      () => {
+        resolve(revertDialog.returnValue === "revert");
+      },
+      { once: true },
+    );
+  });
+}
+
+async function revertTo(update: HistoryUpdate): Promise<void> {
+  if (revertDialog.open || resettingPage) return;
+  const confirmed = await confirmRevert(update);
+  if (!confirmed || resettingPage) return;
+  const confirmButton = revertDialog.querySelector<HTMLButtonElement>("#revert-confirm");
+  if (confirmButton) confirmButton.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/documents/${encodeURIComponent(documentName)}/updates/${update.id}/revert`,
+      { method: "POST" },
+    );
+    if (resettingPage) return;
+    if (!response.ok) {
+      statusNode.textContent = "That version could not be restored.";
+      return;
+    }
+    resetPage();
+  } catch {
+    if (!resettingPage) statusNode.textContent = "That version could not be restored.";
+  } finally {
+    if (confirmButton) confirmButton.disabled = false;
+  }
 }
 
 function formatDelta(delta: number): string {
